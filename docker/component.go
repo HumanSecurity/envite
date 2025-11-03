@@ -327,7 +327,7 @@ func (c *Component) Exec(ctx context.Context, cmd []string) (int, error) {
 	}
 
 	c.Writer().WriteString(c.Writer().Color.Cyan(fmt.Sprintf("executing: %s", strings.Join(cmd, " "))))
-	response, err := c.cli.ContainerExecCreate(ctx, cont.ID, types.ExecConfig{
+	response, err := c.cli.ContainerExecCreate(ctx, cont.ID, container.ExecOptions{
 		Cmd:          cmd,
 		Detach:       false,
 		AttachStdout: true,
@@ -337,7 +337,7 @@ func (c *Component) Exec(ctx context.Context, cmd []string) (int, error) {
 		return 0, fmt.Errorf("failed to create exec: %w", err)
 	}
 
-	hijack, err := c.cli.ContainerExecAttach(ctx, response.ID, types.ExecStartCheck{})
+	hijack, err := c.cli.ContainerExecAttach(ctx, response.ID, container.ExecStartOptions{})
 	if err != nil {
 		return 0, fmt.Errorf("failed to attach exec: %w", err)
 	}

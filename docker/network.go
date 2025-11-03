@@ -14,7 +14,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
@@ -69,7 +68,7 @@ func (n *Network) NewComponent(config Config) (*Component, error) {
 }
 
 func newClosedNetwork(cli *client.Client, envID, networkIdentifier string, runtimeInfo *RuntimeInfo) (*Network, error) {
-	networks, err := cli.NetworkList(context.Background(), types.NetworkListOptions{})
+	networks, err := cli.NetworkList(context.Background(), network.ListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list networks: %w", err)
 	}
@@ -192,13 +191,13 @@ func createNetworkIfNotExist(cli *client.Client, name, driver string) (string, e
 	return res.ID, nil
 }
 
-func findNetwork(networks []types.NetworkResource, identifier string) (types.NetworkResource, error) {
+func findNetwork(networks []network.Summary, identifier string) (network.Summary, error) {
 	for _, current := range networks {
 		if current.ID == identifier || current.Name == identifier {
 			return current, nil
 		}
 	}
-	return types.NetworkResource{}, ErrNetworkNotExist{network: identifier}
+	return network.Summary{}, ErrNetworkNotExist{network: identifier}
 }
 
 //go:embed setup-needed.txt
