@@ -7,11 +7,12 @@ package docker
 import (
 	"context"
 	"fmt"
-	"github.com/docker/docker/client"
-	"github.com/docker/docker/pkg/stdcopy"
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/moby/moby/api/pkg/stdcopy"
+	"github.com/moby/moby/client"
 )
 
 // WaitForLog creates a waiter for waiting until a specific string is found in the container logs.

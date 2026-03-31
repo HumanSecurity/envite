@@ -7,7 +7,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/docker/docker/client"
+
+	"github.com/moby/moby/client"
 	"github.com/perimeterx/envite"
 	"github.com/perimeterx/envite/docker"
 )

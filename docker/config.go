@@ -5,19 +5,21 @@
 package docker
 
 import (
+	"context"
 	"fmt"
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/blkiodev"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/api/types/strslice"
-	"github.com/docker/go-units"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"gopkg.in/yaml.v3"
+	"net/netip"
 	"os"
 	"time"
+
+	"github.com/docker/go-units"
+	"github.com/moby/moby/api/types/blkiodev"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/api/types/strslice"
+	"github.com/moby/moby/client"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"gopkg.in/yaml.v3"
 )
 
 // Config represents Docker Component configuration
@@ -92,7 +94,8 @@ type Config struct {
 	// NetworkDisabled - used for https://github.com/moby/moby/blob/v24.0.6/api/types/container/config.go#L89
 	NetworkDisabled bool `json:"network_disabled,omitempty"`
 
-	// MacAddress - used for https://github.com/moby/moby/blob/v24.0.6/api/types/container/config.go#L90
+	// MacAddress - DEPRECATED in v29: MAC address is now set via network endpoint settings
+	// This field is kept for backwards compatibility but is no longer used
 	MacAddress string `json:"mac_address,omitempty"`
 
 	// OnBuild - used for https://github.com/moby/moby/blob/v24.0.6/api/types/container/config.go#L91
@@ -287,7 +290,8 @@ type ImagePullOptions struct {
 
 	// PrivilegeFunc - used for https://github.com/moby/moby/blob/v24.0.6/api/types/client.go#L281
 	// available only via code, not available in config files
-	PrivilegeFunc types.RequestPrivilegeFunc `json:"-"`
+	// Updated signature for v29 - now takes context.Context
+	PrivilegeFunc func() (string, error) `json:"-"`
 
 	// Platform - used for https://github.com/moby/moby/blob/v24.0.6/api/types/client.go#L282
 	Platform string `json:"platform,omitempty"`
@@ -393,7 +397,8 @@ type Resources struct {
 	// DeviceRequests - used for https://github.com/moby/moby/blob/v24.0.6/api/types/container/hostconfig.go#L348
 	DeviceRequests []DeviceRequest `json:"device_requests,omitempty"`
 
-	// KernelMemoryTCP - used for https://github.com/moby/moby/blob/v24.0.6/api/types/container/hostconfig.go#L353
+	// KernelMemoryTCP - DEPRECATED: This field has been removed in Docker v29
+	// This field is kept for backwards compatibility but is no longer used
 	KernelMemoryTCP int64 `json:"kernel_memory_tcp,omitempty"`
 
 	// MemoryReservation - used for https://github.com/moby/moby/blob/v24.0.6/api/types/container/hostconfig.go#L354
@@ -643,8 +648,8 @@ func (c Config) initialize(network *Network, imageCloneTag string) (*runConfig, 
 	return result, nil
 }
 
-func (c Config) imagePullOptions() (image.PullOptions, error) {
-	result := image.PullOptions{}
+func (c Config) imagePullOptions() (client.ImagePullOptions, error) {
+	result := client.ImagePullOptions{}
 
 	if c.ImagePullOptions != nil {
 		var auth string
@@ -652,7 +657,7 @@ func (c Config) imagePullOptions() (image.PullOptions, error) {
 			var err error
 			auth, err = c.ImagePullOptions.RegistryAuthFunc()
 			if err != nil {
-				return image.PullOptions{}, fmt.Errorf("failed to get registry auth: %w", err)
+				return client.ImagePullOptions{}, fmt.Errorf("failed to get registry auth: %w", err)
 			}
 		} else {
 			auth = c.ImagePullOptions.RegistryAuth
@@ -660,8 +665,16 @@ func (c Config) imagePullOptions() (image.PullOptions, error) {
 
 		result.All = c.ImagePullOptions.All
 		result.RegistryAuth = auth
-		result.PrivilegeFunc = c.ImagePullOptions.PrivilegeFunc
-		result.Platform = c.ImagePullOptions.Platform
+		// Note: PrivilegeFunc signature changed in v29 - now takes context.Context
+		if c.ImagePullOptions.PrivilegeFunc != nil {
+			result.PrivilegeFunc = func(_ context.Context) (string, error) {
+				return c.ImagePullOptions.PrivilegeFunc()
+			}
+		}
+		// Platform is now an array of platforms in v29
+		if c.ImagePullOptions.Platform != "" {
+			result.Platforms = []ocispec.Platform{{OS: c.ImagePullOptions.Platform}}
+		}
 	}
 
 	return result, nil
@@ -693,12 +706,12 @@ func (c Config) containerConfig(imageCloneTag string) *container.Config {
 		WorkingDir:      c.WorkingDir,
 		Entrypoint:      strslice.StrSlice(c.Entrypoint),
 		NetworkDisabled: c.NetworkDisabled,
-		MacAddress:      c.MacAddress,
-		OnBuild:         c.OnBuild,
-		Labels:          c.Labels,
-		StopSignal:      c.StopSignal,
-		StopTimeout:     c.StopTimeout,
-		Shell:           strslice.StrSlice(c.Shell),
+		// MacAddress has been removed in v29 - now set via network endpoint settings
+		OnBuild:     c.OnBuild,
+		Labels:      c.Labels,
+		StopSignal:  c.StopSignal,
+		StopTimeout: c.StopTimeout,
+		Shell:       strslice.StrSlice(c.Shell),
 	}
 }
 
@@ -734,7 +747,7 @@ func (c Config) hostConfig(network *Network) *container.HostConfig {
 		CapAdd:          strslice.StrSlice(c.CapAdd),
 		CapDrop:         strslice.StrSlice(c.CapDrop),
 		CgroupnsMode:    c.CgroupnsMode,
-		DNS:             c.DNS,
+		DNS:             convertDNSToNetipAddrs(c.DNS),
 		DNSOptions:      c.DNSOptions,
 		DNSSearch:       c.DNSSearch,
 		ExtraHosts:      c.ExtraHosts,
@@ -811,17 +824,17 @@ func (c *Resources) build() container.Resources {
 		Devices:              mapSlice(c.Devices, DeviceMapping.build),
 		DeviceCgroupRules:    c.DeviceCgroupRules,
 		DeviceRequests:       mapSlice(c.DeviceRequests, DeviceRequest.build),
-		KernelMemoryTCP:      c.KernelMemoryTCP,
-		MemoryReservation:    c.MemoryReservation,
-		MemorySwap:           c.MemorySwap,
-		MemorySwappiness:     c.MemorySwappiness,
-		OomKillDisable:       c.OomKillDisable,
-		PidsLimit:            c.PidsLimit,
-		Ulimits:              mapSlice(c.Ulimits, Ulimit.build),
-		CPUCount:             c.CPUCount,
-		CPUPercent:           c.CPUPercent,
-		IOMaximumIOps:        c.IOMaximumIOps,
-		IOMaximumBandwidth:   c.IOMaximumBandwidth,
+		// KernelMemoryTCP removed in v29
+		MemoryReservation: c.MemoryReservation,
+		MemorySwap:        c.MemorySwap,
+		MemorySwappiness:  c.MemorySwappiness,
+		OomKillDisable:    c.OomKillDisable,
+		PidsLimit:         c.PidsLimit,
+		Ulimits:           mapSlice(c.Ulimits, Ulimit.build),
+		CPUCount:          c.CPUCount,
+		CPUPercent:        c.CPUPercent,
+		IOMaximumIOps:     c.IOMaximumIOps,
+		IOMaximumBandwidth: c.IOMaximumBandwidth,
 	}
 }
 
@@ -955,4 +968,19 @@ type ErrInvalidConfig struct {
 
 func (e ErrInvalidConfig) Error() string {
 	return fmt.Sprintf("invalid docker config - property %s: %s", e.Property, e.Msg)
+}
+
+// convertDNSToNetipAddrs converts DNS server strings to netip.Addr slice
+func convertDNSToNetipAddrs(dns []string) []netip.Addr {
+	if len(dns) == 0 {
+		return nil
+	}
+	result := make([]netip.Addr, 0, len(dns))
+	for _, d := range dns {
+		addr, err := netip.ParseAddr(d)
+		if err == nil {
+			result = append(result, addr)
+		}
+	}
+	return result
 }
