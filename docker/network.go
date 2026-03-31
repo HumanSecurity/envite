@@ -147,7 +147,9 @@ func newOpenNetwork(cli *client.Client, envID string, runtimeInfo *RuntimeInfo) 
 				}
 				p, err := network.ParsePort(fmt.Sprintf("%s/%s", port.Port, protocol))
 				if err != nil {
-					continue // Skip invalid ports
+					// Log warning about invalid port but continue with other ports
+					fmt.Printf("warning: invalid port configuration '%s/%s': %v\n", port.Port, protocol, err)
+					continue
 				}
 				runConfig.containerConfig.ExposedPorts[p] = struct{}{}
 				runConfig.hostConfig.PortBindings[p] = append(runConfig.hostConfig.PortBindings[p], network.PortBinding{

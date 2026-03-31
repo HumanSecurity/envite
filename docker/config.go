@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/docker/go-units"
@@ -672,8 +673,10 @@ func (c Config) imagePullOptions() (client.ImagePullOptions, error) {
 			}
 		}
 		// Platform is now an array of platforms in v29
+		// Parse platform string in format "os[/arch[/variant]]" (e.g., "linux/amd64", "linux/arm64/v8")
 		if c.ImagePullOptions.Platform != "" {
-			result.Platforms = []ocispec.Platform{{OS: c.ImagePullOptions.Platform}}
+			platform := parsePlatformString(c.ImagePullOptions.Platform)
+			result.Platforms = []ocispec.Platform{platform}
 		}
 	}
 
@@ -983,4 +986,21 @@ func convertDNSToNetipAddrs(dns []string) []netip.Addr {
 		}
 	}
 	return result
+}
+
+// parsePlatformString parses a platform string in format "os[/arch[/variant]]"
+// e.g., "linux", "linux/amd64", "linux/arm64/v8"
+func parsePlatformString(platform string) ocispec.Platform {
+	parts := strings.Split(platform, "/")
+	p := ocispec.Platform{}
+	if len(parts) >= 1 {
+		p.OS = parts[0]
+	}
+	if len(parts) >= 2 {
+		p.Architecture = parts[1]
+	}
+	if len(parts) >= 3 {
+		p.Variant = parts[2]
+	}
+	return p
 }
