@@ -15,14 +15,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/client"
-	"github.com/docker/docker/errdefs"
-	"github.com/docker/docker/pkg/jsonmessage"
-	"github.com/docker/docker/pkg/stdcopy"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/moby/moby/api/pkg/stdcopy"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
+	"github.com/moby/moby/api/types/jsonstream"
 	"github.com/perimeterx/envite"
 )
 
@@ -63,6 +60,15 @@ func newComponent(
 
 	containerName := fmt.Sprintf("%s_%s", envID, config.Name)
 	network.configure(config, runConf, containerName)
+
+	// The container.Config.MacAddress field was removed from the Docker API.
+	// A MAC address is now set per network endpoint, so apply the configured
+	// value to the endpoints created by network.configure.
+	if runConf.macAddress != nil && runConf.networkingConfig != nil {
+		for _, endpoint := range runConf.networkingConfig.EndpointsConfig {
+			endpoint.MacAddress = runConf.macAddress
+		}
+	}
 
 	c := &Component{
 		cli:           cli,
@@ -121,7 +127,11 @@ func (c *Component) Prepare(ctx context.Context) error {
 
 	// create a dedicated copy of the docker image to prevent
 	// other environments running concurrently from removing our image.
-	return c.cli.ImageTag(ctx, c.config.Image, c.imageCloneTag)
+	_, err = c.cli.ImageTag(ctx, client.ImageTagOptions{
+		Source: c.config.Image,
+		Target: c.imageCloneTag,
+	})
+	return err
 }
 
 // pullImage pulls the Docker image specified in the configuration.
@@ -144,7 +154,7 @@ func (c *Component) pullImage(ctx context.Context) error {
 	scanner := bufio.NewScanner(reader)
 	for scanner.Scan() {
 		bytes := scanner.Bytes()
-		msg := jsonmessage.JSONMessage{}
+		msg := jsonstream.Message{}
 		err = json.Unmarshal(bytes, &msg)
 		if err != nil {
 			return fmt.Errorf("failed to parse image pull output: %w", err)
@@ -191,17 +201,16 @@ func (c *Component) startContainer(ctx context.Context) (string, error) {
 	defer c.lock.Unlock()
 
 	var id string
-	res, err := c.cli.ContainerCreate(
-		ctx,
-		c.runConfig.containerConfig,
-		c.runConfig.hostConfig,
-		c.runConfig.networkingConfig,
-		c.runConfig.platformConfig,
-		c.containerName,
-	)
+	res, err := c.cli.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Config:           c.runConfig.containerConfig,
+		HostConfig:       c.runConfig.hostConfig,
+		NetworkingConfig: c.runConfig.networkingConfig,
+		Platform:         c.runConfig.platformConfig,
+		Name:             c.containerName,
+	})
 	if err == nil {
 		id = res.ID
-	} else if !errdefs.IsConflict(err) {
+	} else if !cerrdefs.IsConflict(err) {
 		return "", fmt.Errorf("failed to create container: %w", err)
 	} else {
 		cont, err := c.findContainer(ctx)
@@ -212,7 +221,7 @@ func (c *Component) startContainer(ctx context.Context) (string, error) {
 		id = cont.ID
 	}
 
-	err = c.cli.ContainerStart(context.Background(), id, container.StartOptions{})
+	_, err = c.cli.ContainerStart(context.Background(), id, client.ContainerStartOptions{})
 	if err != nil {
 		return "", fmt.Errorf("failed to start container: %w", err)
 	}
@@ -234,13 +243,13 @@ func (c *Component) Stop(ctx context.Context) error {
 		return nil
 	}
 
-	err = c.cli.ContainerStop(ctx, cont.ID, container.StopOptions{})
+	_, err = c.cli.ContainerStop(ctx, cont.ID, client.ContainerStopOptions{})
 	if err != nil {
 		return err
 	}
 
-	err = c.cli.ContainerRemove(ctx, cont.ID, container.RemoveOptions{Force: true})
-	if err != nil && !errdefs.IsNotFound(err) && !errdefs.IsConflict(err) {
+	_, err = c.cli.ContainerRemove(ctx, cont.ID, client.ContainerRemoveOptions{Force: true})
+	if err != nil && !cerrdefs.IsNotFound(err) && !cerrdefs.IsConflict(err) {
 		return err
 	}
 
@@ -261,7 +270,7 @@ func (c *Component) Cleanup(ctx context.Context) error {
 }
 
 func (c *Component) removeImage(ctx context.Context) error {
-	_, err := c.cli.ImageRemove(ctx, c.imageCloneTag, image.RemoveOptions{})
+	_, err := c.cli.ImageRemove(ctx, c.imageCloneTag, client.ImageRemoveOptions{})
 	if err != nil && !strings.Contains(err.Error(), "reference does not exist") && !strings.Contains(err.Error(), "No such image") {
 		return err
 	}
@@ -271,8 +280,8 @@ func (c *Component) removeImage(ctx context.Context) error {
 		return nil
 	}
 
-	_, err = c.cli.ImageRemove(ctx, c.config.Image, image.RemoveOptions{})
-	if err != nil && !errdefs.IsNotFound(err) {
+	_, err = c.cli.ImageRemove(ctx, c.config.Image, client.ImageRemoveOptions{})
+	if err != nil && !cerrdefs.IsNotFound(err) {
 		return err
 	}
 
@@ -289,7 +298,7 @@ func (c *Component) Status(context.Context) (envite.ComponentStatus, error) {
 			return "", fmt.Errorf("failed to find container: %w", err)
 		}
 
-		if cont == nil || cont.State != "running" {
+		if cont == nil || cont.State != container.StateRunning {
 			status = envite.ComponentStatusStopped
 			c.status.Store(envite.ComponentStatusStopped)
 		}
@@ -327,9 +336,8 @@ func (c *Component) Exec(ctx context.Context, cmd []string) (int, error) {
 	}
 
 	c.Writer().WriteString(c.Writer().Color.Cyan(fmt.Sprintf("executing: %s", strings.Join(cmd, " "))))
-	response, err := c.cli.ContainerExecCreate(ctx, cont.ID, container.ExecOptions{
+	response, err := c.cli.ExecCreate(ctx, cont.ID, client.ExecCreateOptions{
 		Cmd:          cmd,
-		Detach:       false,
 		AttachStdout: true,
 		AttachStderr: true,
 	})
@@ -337,7 +345,7 @@ func (c *Component) Exec(ctx context.Context, cmd []string) (int, error) {
 		return 0, fmt.Errorf("failed to create exec: %w", err)
 	}
 
-	hijack, err := c.cli.ContainerExecAttach(ctx, response.ID, container.ExecStartOptions{})
+	hijack, err := c.cli.ExecAttach(ctx, response.ID, client.ExecAttachOptions{})
 	if err != nil {
 		return 0, fmt.Errorf("failed to attach exec: %w", err)
 	}
@@ -349,7 +357,7 @@ func (c *Component) Exec(ctx context.Context, cmd []string) (int, error) {
 
 	hijack.Close()
 
-	execResp, err := c.cli.ContainerExecInspect(ctx, response.ID)
+	execResp, err := c.cli.ExecInspect(ctx, response.ID, client.ExecInspectOptions{})
 	if err != nil {
 		return 0, fmt.Errorf("failed to inspect exec: %w", err)
 	}
@@ -358,18 +366,19 @@ func (c *Component) Exec(ctx context.Context, cmd []string) (int, error) {
 	return execResp.ExitCode, nil
 }
 
-func (c *Component) findContainer(ctx context.Context) (*types.Container, error) {
-	containers, err := c.cli.ContainerList(ctx, container.ListOptions{
+func (c *Component) findContainer(ctx context.Context) (*container.Summary, error) {
+	listResult, err := c.cli.ContainerList(ctx, client.ContainerListOptions{
 		All:     true,
-		Filters: filters.NewArgs(filters.Arg("name", c.containerName)),
+		Filters: make(client.Filters).Add("name", c.containerName),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list containers: %w", err)
 	}
 
-	for _, co := range containers {
+	for i := range listResult.Items {
+		co := &listResult.Items[i]
 		if len(co.Names) > 0 && co.Names[0][1:] == c.containerName {
-			return &co, nil
+			return co, nil
 		}
 	}
 

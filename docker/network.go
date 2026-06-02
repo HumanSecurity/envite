@@ -14,10 +14,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/client"
-	"github.com/docker/go-connections/nat"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/client"
 )
 
 // Network represents a Docker network.
@@ -68,12 +67,12 @@ func (n *Network) NewComponent(config Config) (*Component, error) {
 }
 
 func newClosedNetwork(cli *client.Client, envID, networkIdentifier string, runtimeInfo *RuntimeInfo) (*Network, error) {
-	networks, err := cli.NetworkList(context.Background(), network.ListOptions{})
+	listResult, err := cli.NetworkList(context.Background(), client.NetworkListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list networks: %w", err)
 	}
 
-	nw, err := findNetwork(networks, networkIdentifier)
+	nw, err := findNetwork(listResult.Items, networkIdentifier)
 	if err != nil {
 		return nil, fmt.Errorf("failed to find network: %w", err)
 	}
@@ -139,16 +138,16 @@ func newOpenNetwork(cli *client.Client, envID string, runtimeInfo *RuntimeInfo) 
 				EndpointsConfig: map[string]*network.EndpointSettings{id: {NetworkID: id}},
 			}
 			runConfig.hostname = runtimeInfo.InternalHostname
-			runConfig.containerConfig.ExposedPorts = nat.PortSet{}
-			runConfig.hostConfig.PortBindings = nat.PortMap{}
+			runConfig.containerConfig.ExposedPorts = network.PortSet{}
+			runConfig.hostConfig.PortBindings = network.PortMap{}
 			for _, port := range config.Ports {
 				protocol := port.Protocol
 				if protocol == "" {
 					protocol = "tcp"
 				}
-				p := nat.Port(fmt.Sprintf("%s/%s", port.Port, protocol))
+				p := network.MustParsePort(fmt.Sprintf("%s/%s", port.Port, protocol))
 				runConfig.containerConfig.ExposedPorts[p] = struct{}{}
-				runConfig.hostConfig.PortBindings[p] = append(runConfig.hostConfig.PortBindings[p], nat.PortBinding{
+				runConfig.hostConfig.PortBindings[p] = append(runConfig.hostConfig.PortBindings[p], network.PortBinding{
 					HostPort: port.Port,
 				})
 			}
@@ -166,7 +165,7 @@ func (n *Network) delete(ctx context.Context, c *Component) error {
 
 	n.lock.Lock()
 	defer n.lock.Unlock()
-	err := c.cli.NetworkRemove(ctx, c.envID)
+	_, err := c.cli.NetworkRemove(ctx, c.envID, client.NetworkRemoveOptions{})
 	if err != nil &&
 		!strings.Contains(err.Error(), "has active endpoints") &&
 		!strings.Contains(err.Error(), "not found") {
@@ -177,7 +176,7 @@ func (n *Network) delete(ctx context.Context, c *Component) error {
 }
 
 func createNetworkIfNotExist(cli *client.Client, name, driver string) (string, error) {
-	res, err := cli.NetworkCreate(context.Background(), name, network.CreateOptions{
+	res, err := cli.NetworkCreate(context.Background(), name, client.NetworkCreateOptions{
 		Driver: driver,
 	})
 	if err != nil {

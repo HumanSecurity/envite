@@ -7,8 +7,8 @@ package docker
 import (
 	"context"
 	"fmt"
-	"github.com/docker/docker/client"
-	"github.com/docker/docker/pkg/stdcopy"
+	"github.com/moby/moby/api/pkg/stdcopy"
+	"github.com/moby/moby/client"
 	"regexp"
 	"strings"
 	"time"
