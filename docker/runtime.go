@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/docker/docker/client"
+	"github.com/moby/moby/client"
 )
 
 // RuntimeInfo contains information about a runtime type
@@ -21,11 +21,12 @@ type RuntimeInfo struct {
 
 // ExtractRuntimeInfo detects the Docker daemon implementation for the given client
 func ExtractRuntimeInfo(ctx context.Context, cli *client.Client) (*RuntimeInfo, error) {
-	info, err := cli.Info(ctx)
+	infoResult, err := cli.Info(ctx, client.InfoOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get docker info: %w", err)
 	}
 
+	info := infoResult.Info
 	name := strings.ToLower(info.Name)
 	serverVersion := strings.ToLower(info.ServerVersion)
 

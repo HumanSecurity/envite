@@ -6,18 +6,22 @@ package docker
 
 import (
 	"fmt"
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/blkiodev"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/api/types/strslice"
+	"net"
+	"net/netip"
+	"os"
+	"strings"
+	"time"
+
 	"github.com/docker/go-units"
+	"github.com/moby/moby/api/types/blkiodev"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/api/types/registry"
+	"github.com/moby/moby/api/types/strslice"
+	mobyclient "github.com/moby/moby/client"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"gopkg.in/yaml.v3"
-	"os"
-	"time"
 )
 
 // Config represents Docker Component configuration
@@ -287,7 +291,7 @@ type ImagePullOptions struct {
 
 	// PrivilegeFunc - used for https://github.com/moby/moby/blob/v24.0.6/api/types/client.go#L281
 	// available only via code, not available in config files
-	PrivilegeFunc types.RequestPrivilegeFunc `json:"-"`
+	PrivilegeFunc registry.RequestAuthConfig `json:"-"`
 
 	// Platform - used for https://github.com/moby/moby/blob/v24.0.6/api/types/client.go#L282
 	Platform string `json:"platform,omitempty"`
@@ -393,7 +397,13 @@ type Resources struct {
 	// DeviceRequests - used for https://github.com/moby/moby/blob/v24.0.6/api/types/container/hostconfig.go#L348
 	DeviceRequests []DeviceRequest `json:"device_requests,omitempty"`
 
-	// KernelMemoryTCP - used for https://github.com/moby/moby/blob/v24.0.6/api/types/container/hostconfig.go#L353
+	// KernelMemoryTCP is deprecated and no longer has any effect.
+	//
+	// The Docker API removed support for the kernel memory TCP limit, so this
+	// field is not mapped onto container.Resources. Setting it results in a
+	// validation error to avoid silently ignoring the option.
+	//
+	// Deprecated: KernelMemoryTCP is unsupported and must not be set.
 	KernelMemoryTCP int64 `json:"kernel_memory_tcp,omitempty"`
 
 	// MemoryReservation - used for https://github.com/moby/moby/blob/v24.0.6/api/types/container/hostconfig.go#L354
@@ -606,6 +616,7 @@ type runConfig struct {
 	hostConfig       *container.HostConfig
 	networkingConfig *network.NetworkingConfig
 	platformConfig   *ocispec.Platform
+	macAddress       network.HardwareAddr
 	waiters          []waiterFunc
 }
 
@@ -623,6 +634,13 @@ func (c Config) initialize(network *Network, imageCloneTag string) (*runConfig, 
 		return nil, ErrInvalidConfig{Property: "console_size", Msg: "must have exactly two elements"}
 	}
 
+	if c.Resources != nil && c.Resources.KernelMemoryTCP != 0 {
+		return nil, ErrInvalidConfig{
+			Property: "resources.kernel_memory_tcp",
+			Msg:      "is no longer supported by the Docker API and has no effect; remove it from the configuration",
+		}
+	}
+
 	waiters := make([]waiterFunc, len(c.Waiters))
 	for i, waiter := range c.Waiters {
 		f, err := validateWaiter(waiter)
@@ -633,18 +651,45 @@ func (c Config) initialize(network *Network, imageCloneTag string) (*runConfig, 
 		waiters[i] = f
 	}
 
+	hostConfig, err := c.hostConfig(network)
+	if err != nil {
+		return nil, err
+	}
+
+	macAddress, err := parseMacAddress(c.MacAddress)
+	if err != nil {
+		return nil, err
+	}
+
 	result := &runConfig{
 		containerConfig: c.containerConfig(imageCloneTag),
-		hostConfig:      c.hostConfig(network),
+		hostConfig:      hostConfig,
 		platformConfig:  c.PlatformConfig.build(),
+		macAddress:      macAddress,
 		waiters:         waiters,
 	}
 
 	return result, nil
 }
 
-func (c Config) imagePullOptions() (image.PullOptions, error) {
-	result := image.PullOptions{}
+// parseMacAddress validates and parses a MAC address string into the type
+// expected by the Docker network endpoint config. An empty string is valid and
+// results in no MAC address being set.
+func parseMacAddress(macAddress string) (network.HardwareAddr, error) {
+	if macAddress == "" {
+		return nil, nil
+	}
+
+	parsed, err := net.ParseMAC(macAddress)
+	if err != nil {
+		return nil, ErrInvalidConfig{Property: "mac_address", Msg: err.Error()}
+	}
+
+	return network.HardwareAddr(parsed), nil
+}
+
+func (c Config) imagePullOptions() (mobyclient.ImagePullOptions, error) {
+	result := mobyclient.ImagePullOptions{}
 
 	if c.ImagePullOptions != nil {
 		var auth string
@@ -652,19 +697,58 @@ func (c Config) imagePullOptions() (image.PullOptions, error) {
 			var err error
 			auth, err = c.ImagePullOptions.RegistryAuthFunc()
 			if err != nil {
-				return image.PullOptions{}, fmt.Errorf("failed to get registry auth: %w", err)
+				return mobyclient.ImagePullOptions{}, fmt.Errorf("failed to get registry auth: %w", err)
 			}
 		} else {
 			auth = c.ImagePullOptions.RegistryAuth
 		}
 
+		platforms, err := parsePlatforms(c.ImagePullOptions.Platform)
+		if err != nil {
+			return mobyclient.ImagePullOptions{}, err
+		}
+
 		result.All = c.ImagePullOptions.All
 		result.RegistryAuth = auth
 		result.PrivilegeFunc = c.ImagePullOptions.PrivilegeFunc
-		result.Platform = c.ImagePullOptions.Platform
+		result.Platforms = platforms
 	}
 
 	return result, nil
+}
+
+func parseDNSAddrs(addrs []string) ([]netip.Addr, error) {
+	result := make([]netip.Addr, 0, len(addrs))
+	for _, addr := range addrs {
+		parsed, err := netip.ParseAddr(addr)
+		if err != nil {
+			return nil, ErrInvalidConfig{Property: "dns", Msg: fmt.Sprintf("invalid DNS address %q: %s", addr, err)}
+		}
+		result = append(result, parsed)
+	}
+	return result, nil
+}
+
+func parsePlatforms(platform string) ([]ocispec.Platform, error) {
+	if platform == "" {
+		return nil, nil
+	}
+
+	parts := strings.Split(platform, "/")
+	for _, part := range parts {
+		if part == "" {
+			return nil, fmt.Errorf("invalid platform %q: segments must not be empty", platform)
+		}
+	}
+
+	switch len(parts) {
+	case 2:
+		return []ocispec.Platform{{OS: parts[0], Architecture: parts[1]}}, nil
+	case 3:
+		return []ocispec.Platform{{OS: parts[0], Architecture: parts[1], Variant: parts[2]}}, nil
+	default:
+		return nil, fmt.Errorf("invalid platform %q: expected os/arch[/variant]", platform)
+	}
 }
 
 func (c Config) containerConfig(imageCloneTag string) *container.Config {
@@ -693,7 +777,6 @@ func (c Config) containerConfig(imageCloneTag string) *container.Config {
 		WorkingDir:      c.WorkingDir,
 		Entrypoint:      strslice.StrSlice(c.Entrypoint),
 		NetworkDisabled: c.NetworkDisabled,
-		MacAddress:      c.MacAddress,
 		OnBuild:         c.OnBuild,
 		Labels:          c.Labels,
 		StopSignal:      c.StopSignal,
@@ -716,11 +799,17 @@ func (c *Healthcheck) build() *container.HealthConfig {
 	}
 }
 
-func (c Config) hostConfig(network *Network) *container.HostConfig {
+func (c Config) hostConfig(network *Network) (*container.HostConfig, error) {
 	var consoleSize [2]uint
 	if len(c.ConsoleSize) > 0 {
 		consoleSize = [2]uint{c.ConsoleSize[0], c.ConsoleSize[1]}
 	}
+
+	dns, err := parseDNSAddrs(c.DNS)
+	if err != nil {
+		return nil, err
+	}
+
 	return &container.HostConfig{
 		Binds:           c.Binds,
 		ContainerIDFile: c.ContainerIDFile,
@@ -734,7 +823,7 @@ func (c Config) hostConfig(network *Network) *container.HostConfig {
 		CapAdd:          strslice.StrSlice(c.CapAdd),
 		CapDrop:         strslice.StrSlice(c.CapDrop),
 		CgroupnsMode:    c.CgroupnsMode,
-		DNS:             c.DNS,
+		DNS:             dns,
 		DNSOptions:      c.DNSOptions,
 		DNSSearch:       c.DNSSearch,
 		ExtraHosts:      c.ExtraHosts,
@@ -761,7 +850,7 @@ func (c Config) hostConfig(network *Network) *container.HostConfig {
 		MaskedPaths:     c.MaskedPaths,
 		ReadonlyPaths:   c.ReadonlyPaths,
 		Init:            c.Init,
-	}
+	}, nil
 }
 
 func (c *LogConfig) build() container.LogConfig {
@@ -811,7 +900,6 @@ func (c *Resources) build() container.Resources {
 		Devices:              mapSlice(c.Devices, DeviceMapping.build),
 		DeviceCgroupRules:    c.DeviceCgroupRules,
 		DeviceRequests:       mapSlice(c.DeviceRequests, DeviceRequest.build),
-		KernelMemoryTCP:      c.KernelMemoryTCP,
 		MemoryReservation:    c.MemoryReservation,
 		MemorySwap:           c.MemorySwap,
 		MemorySwappiness:     c.MemorySwappiness,
